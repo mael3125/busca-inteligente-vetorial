@@ -5,7 +5,7 @@ import psycopg2
 import requests
 import traceback
 
-DATABASE_URL = os.environ.get("DATABASE_URL")
+DATABASE_URL = os.environ.get("postgresql://postgres:vpS720D8a1jrd6T8@db.wssltptloqjghdjnudoa.supabase.co:5432/postgres")
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
 print(f"API iniciada. DATABASE_URL configurada? {bool(DATABASE_URL)}")
