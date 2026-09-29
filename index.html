@@ -62,7 +62,8 @@ h1 { font-size: 32px; font-weight: 800; display:flex; align-items:center; gap:10
 
 <script>
 // TROQUE AQUI QUANDO PUBLICAR NO RENDER
-const API_URL = "https://busca-inteligente-vetorial.onrender.com/buscar";
+const API_URL = "https://busca-inteligente-vetorial.onrender.com/buscar"
+fetch(`${API_URL}?q=${encodeURIComponent(document.getElementById('q').value)}`)
 // Depois vai ficar tipo: https://seu-projeto.onrender.com/buscar
 
 const input = document.getElementById('q');
