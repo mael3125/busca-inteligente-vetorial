@@ -1,8 +1,3 @@
-"""
-API LEVE CORRIGIDA - Render Free
-Fix: HTTPCredentials -> HTTPAuthorizationCredentials
-"""
-
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,9 +6,9 @@ import psycopg2
 from psycopg2 import pool
 import os, jwt, hashlib
 from datetime import datetime, timedelta
-from typing import List
+from typing import List, Optional
 
-app = FastAPI(title="Busca Vetorial - API Leve Render")
+app = FastAPI(title="Busca Vetorial - API Leve FIX")
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
@@ -28,7 +23,7 @@ if DB_URL:
     except Exception as e:
         print(f"Erro pool: {e}")
 
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
 
 def hash_senha(s): return hashlib.sha256(s.encode()).hexdigest()
 
@@ -36,12 +31,23 @@ def criar_token(dados):
     exp = datetime.utcnow() + timedelta(hours=8)
     return jwt.encode({**dados, "exp": exp}, SECRET_KEY, algorithm=ALGORITHM)
 
-def get_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+def get_user_optional(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
+    if not credentials:
+        return None
     try:
         payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
         return payload
-    except Exception as e:
-        raise HTTPException(401, f"Token inválido: {e}")
+    except:
+        return None
+
+def get_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    if not credentials:
+        raise HTTPException(401, "Not authenticated - faca login em /login")
+    try:
+        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload
+    except:
+        raise HTTPException(401, "Token invalido ou expirado")
 
 def require_role(roles: List[str]):
     def check(user=Depends(get_user)):
@@ -57,14 +63,14 @@ class LoginRequest(BaseModel):
 @app.post("/login")
 def login(req: LoginRequest):
     if not db_pool:
-        raise HTTPException(500, "DATABASE_URL não configurada no Render")
+        raise HTTPException(500, "DATABASE_URL nao configurada")
     conn = db_pool.getconn()
     try:
         cur = conn.cursor()
         cur.execute("SELECT email, role, empresa_id, senha_hash FROM usuarios_busca WHERE email=%s AND ativo=true", (req.email,))
         row = cur.fetchone()
         if not row:
-            raise HTTPException(401, "Usuário não encontrado")
+            raise HTTPException(401, "Usuario nao encontrado")
         if row[3] != hash_senha(req.senha):
             raise HTTPException(401, "Senha incorreta")
         email, role, empresa_id, _ = row
@@ -73,30 +79,51 @@ def login(req: LoginRequest):
     finally:
         db_pool.putconn(conn)
 
-@app.get("/buscar")
-def buscar(q: str, user=Depends(require_role(["admin","gerente","analista"]))):
+def do_busca(q: str, empresa_id: Optional[int], limit: int = 20):
     inicio = datetime.now()
-    if len(q) < 2:
-        return {"busca": q, "resultados": [], "tempo_ms": 0}
     conn = db_pool.getconn()
     try:
         cur = conn.cursor()
         like = f"%{q}%"
-        if user["role"] == "admin":
-            cur.execute("SELECT id, nome, descricao, preco FROM produtos WHERE nome ILIKE %s OR descricao ILIKE %s LIMIT 20", (like, like))
+        if empresa_id is None:
+            cur.execute("SELECT id, nome, descricao, preco FROM produtos WHERE nome ILIKE %s OR descricao ILIKE %s LIMIT %s", (like, like, limit))
         else:
-            cur.execute("SELECT id, nome, descricao, preco FROM produtos WHERE empresa_id=%s AND (nome ILIKE %s OR descricao ILIKE %s) LIMIT 20", (user["empresa_id"], like, like))
+            cur.execute("SELECT id, nome, descricao, preco FROM produtos WHERE empresa_id=%s AND (nome ILIKE %s OR descricao ILIKE %s) LIMIT %s", (empresa_id, like, like, limit))
         resultados = [{"id": r[0], "nome": r[1], "descricao": r[2], "preco": float(r[3]) if r[3] else None, "score": 0.85} for r in cur.fetchall()]
         tempo = int((datetime.now()-inicio).total_seconds()*1000)
+        return resultados, tempo
+    finally:
+        db_pool.putconn(conn)
+
+# ENDPOINT PUBLICO - para o site github.io - SEM LOGIN
+@app.get("/buscar_publica")
+def buscar_publica(q: str):
+    if len(q) < 2:
+        return {"busca": q, "resultados": [], "tempo_ms": 0, "modo": "publico"}
+    if not db_pool:
+        return {"busca": q, "resultados": [], "tempo_ms": 0, "erro": "sem db"}
+    resultados, tempo = do_busca(q, None)
+    return {"busca": q, "resultados": resultados, "tempo_ms": tempo, "modo": "publico-texto"}
+
+# ENDPOINT COM LOGIN - para painel admin
+@app.get("/buscar")
+def buscar(q: str, user=Depends(require_role(["admin","gerente","analista"]))):
+    if len(q) < 2:
+        return {"busca": q, "resultados": [], "tempo_ms": 0}
+    resultados, tempo = do_busca(q, user["empresa_id"] if user["role"]!="admin" else None)
+    # log
+    conn = db_pool.getconn()
+    try:
+        cur = conn.cursor()
         try:
             cur.execute("INSERT INTO logs_busca (empresa_id, usuario_email, termo, resultados, tempo_ms, score_top) VALUES (%s,%s,%s,%s,%s,%s)",
                         (user["empresa_id"], user["email"], q, len(resultados), tempo, 0.85))
             conn.commit()
         except:
             conn.rollback()
-        return {"busca": q, "resultados": resultados, "tempo_ms": tempo, "modo": "texto-leve"}
     finally:
         db_pool.putconn(conn)
+    return {"busca": q, "resultados": resultados, "tempo_ms": tempo, "modo": "privado"}
 
 @app.get("/admin/stats")
 def stats(user=Depends(require_role(["admin"]))):
@@ -113,47 +140,8 @@ def stats(user=Depends(require_role(["admin"]))):
     finally:
         db_pool.putconn(conn)
 
-@app.get("/admin/empresas")
-def empresas(user=Depends(require_role(["admin"]))):
-    conn = db_pool.getconn()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT empresa_id, COUNT(DISTINCT usuario_email), COUNT(*) FILTER (WHERE created_at::date=CURRENT_DATE), COUNT(*) FILTER (WHERE created_at::date=CURRENT_DATE AND resultados=0) FROM logs_busca GROUP BY empresa_id")
-        rows = cur.fetchall()
-        if not rows:
-            return [{"id": 1, "nome": "Empresa Demo", "usuarios": 2, "buscas_hoje": 0, "zeradas_hoje": 0, "status": "saudavel"}]
-        return [{"id": r[0], "nome": f"Empresa {r[0]}", "usuarios": r[1], "buscas_hoje": r[2], "zeradas_hoje": r[3], "status": "saudavel" if r[3]<10 else "atencao"} for r in rows]
-    finally:
-        db_pool.putconn(conn)
-
-@app.get("/admin/termos-zerados")
-def termos_zerados(user=Depends(require_role(["admin","gerente"]))):
-    conn = db_pool.getconn()
-    try:
-        cur = conn.cursor()
-        if user["role"] == "admin":
-            cur.execute("SELECT termo, empresa_id, COUNT(*) as vezes, MAX(created_at) FROM logs_busca WHERE resultados=0 AND created_at > NOW() - INTERVAL '7 days' GROUP BY termo, empresa_id ORDER BY vezes DESC LIMIT 50")
-        else:
-            cur.execute("SELECT termo, empresa_id, COUNT(*) as vezes, MAX(created_at) FROM logs_busca WHERE resultados=0 AND empresa_id=%s AND created_at > NOW() - INTERVAL '7 days' GROUP BY termo, empresa_id ORDER BY vezes DESC LIMIT 50", (user["empresa_id"],))
-        return [{"termo": r[0], "empresa_id": r[1], "vezes": r[2], "ultima": r[3].isoformat() if r[3] else ""} for r in cur.fetchall()]
-    finally:
-        db_pool.putconn(conn)
-
-@app.get("/admin/logs")
-def logs(limit: int = 100, user=Depends(require_role(["admin","gerente"]))):
-    conn = db_pool.getconn()
-    try:
-        cur = conn.cursor()
-        if user["role"] == "admin":
-            cur.execute("SELECT created_at, empresa_id, usuario_email, termo, resultados, tempo_ms FROM logs_busca ORDER BY created_at DESC LIMIT %s", (limit,))
-        else:
-            cur.execute("SELECT created_at, empresa_id, usuario_email, termo, resultados, tempo_ms FROM logs_busca WHERE empresa_id=%s ORDER BY created_at DESC LIMIT %s", (user["empresa_id"], limit))
-        return [{"hora": r[0].isoformat(), "empresa_id": r[1], "usuario": r[2], "termo": r[3], "resultados": r[4], "tempo_ms": r[5]} for r in cur.fetchall()]
-    finally:
-        db_pool.putconn(conn)
-
 @app.get("/health")
-def health(): return {"status": "ok", "versao": "leve-render-free-corrigida", "db": "conectado" if db_pool else "sem DATABASE_URL"}
+def health(): return {"status": "ok", "versao": "fix-publica-privada", "db": "conectado" if db_pool else "sem DATABASE_URL"}
 
 @app.get("/")
-def root(): return {"message": "API Busca Vetorial Leve no ar", "docs": "/docs", "health": "/health"}
+def root(): return {"message": "API no ar", "publica": "/buscar_publica?q=teste", "privada": "/buscar?q=teste (precisa token)", "docs": "/docs"}
