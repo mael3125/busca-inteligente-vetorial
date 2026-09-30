@@ -1,18 +1,10 @@
 """
-API LEVE - 100% compatível com Render Free
-SEM sentence-transformers - não quebra o deploy
-Login + Admin + Busca por similaridade texto
-
-requirements.txt só isso:
-fastapi
-uvicorn
-psycopg2-binary
-PyJWT
-python-multipart
+API LEVE CORRIGIDA - Render Free
+Fix: HTTPCredentials -> HTTPAuthorizationCredentials
 """
 
 from fastapi import FastAPI, Depends, HTTPException
-from fastapi.security import HTTPBearer, HTTPCredentials
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import psycopg2
@@ -31,25 +23,29 @@ DB_URL = os.getenv("DATABASE_URL")
 
 db_pool = None
 if DB_URL:
-    db_pool = pool.SimpleConnectionPool(1, 10, dsn=DB_URL, keepalives=1, keepalives_idle=30)
+    try:
+        db_pool = pool.SimpleConnectionPool(1, 5, dsn=DB_URL, keepalives=1, keepalives_idle=30)
+    except Exception as e:
+        print(f"Erro pool: {e}")
 
 security = HTTPBearer()
 
 def hash_senha(s): return hashlib.sha256(s.encode()).hexdigest()
+
 def criar_token(dados):
     exp = datetime.utcnow() + timedelta(hours=8)
     return jwt.encode({**dados, "exp": exp}, SECRET_KEY, algorithm=ALGORITHM)
 
-def get_user(credentials: HTTPCredentials = Depends(security)):
+def get_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
         payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
         return payload
-    except:
-        raise HTTPException(401, "Token inválido ou expirado")
+    except Exception as e:
+        raise HTTPException(401, f"Token inválido: {e}")
 
 def require_role(roles: List[str]):
     def check(user=Depends(get_user)):
-        if user["role"] not in roles:
+        if user.get("role") not in roles:
             raise HTTPException(403, f"Precisa ser {roles}")
         return user
     return check
@@ -77,7 +73,6 @@ def login(req: LoginRequest):
     finally:
         db_pool.putconn(conn)
 
-# BUSCA LEVE - sem embedding, usa ILIKE + pg_trgm (funciona pra testar login)
 @app.get("/buscar")
 def buscar(q: str, user=Depends(require_role(["admin","gerente","analista"]))):
     inicio = datetime.now()
@@ -86,24 +81,13 @@ def buscar(q: str, user=Depends(require_role(["admin","gerente","analista"]))):
     conn = db_pool.getconn()
     try:
         cur = conn.cursor()
-        # Busca simples que não precisa modelo IA - pra não quebrar Render
-        # Quando quiser vetorial de verdade, faz upgrade pra HuggingFace Inference API
         like = f"%{q}%"
         if user["role"] == "admin":
-            cur.execute("""
-                SELECT id, nome, descricao, preco FROM produtos 
-                WHERE nome ILIKE %s OR descricao ILIKE %s 
-                LIMIT 20
-            """, (like, like))
+            cur.execute("SELECT id, nome, descricao, preco FROM produtos WHERE nome ILIKE %s OR descricao ILIKE %s LIMIT 20", (like, like))
         else:
-            cur.execute("""
-                SELECT id, nome, descricao, preco FROM produtos 
-                WHERE empresa_id=%s AND (nome ILIKE %s OR descricao ILIKE %s)
-                LIMIT 20
-            """, (user["empresa_id"], like, like))
+            cur.execute("SELECT id, nome, descricao, preco FROM produtos WHERE empresa_id=%s AND (nome ILIKE %s OR descricao ILIKE %s) LIMIT 20", (user["empresa_id"], like, like))
         resultados = [{"id": r[0], "nome": r[1], "descricao": r[2], "preco": float(r[3]) if r[3] else None, "score": 0.85} for r in cur.fetchall()]
         tempo = int((datetime.now()-inicio).total_seconds()*1000)
-        # LOG
         try:
             cur.execute("INSERT INTO logs_busca (empresa_id, usuario_email, termo, resultados, tempo_ms, score_top) VALUES (%s,%s,%s,%s,%s,%s)",
                         (user["empresa_id"], user["email"], q, len(resultados), tempo, 0.85))
@@ -134,12 +118,7 @@ def empresas(user=Depends(require_role(["admin"]))):
     conn = db_pool.getconn()
     try:
         cur = conn.cursor()
-        cur.execute("""
-            SELECT empresa_id, COUNT(DISTINCT usuario_email) as usuarios,
-                   COUNT(*) FILTER (WHERE created_at::date=CURRENT_DATE) as hoje,
-                   COUNT(*) FILTER (WHERE created_at::date=CURRENT_DATE AND resultados=0) as zeradas
-            FROM logs_busca GROUP BY empresa_id
-        """)
+        cur.execute("SELECT empresa_id, COUNT(DISTINCT usuario_email), COUNT(*) FILTER (WHERE created_at::date=CURRENT_DATE), COUNT(*) FILTER (WHERE created_at::date=CURRENT_DATE AND resultados=0) FROM logs_busca GROUP BY empresa_id")
         rows = cur.fetchall()
         if not rows:
             return [{"id": 1, "nome": "Empresa Demo", "usuarios": 2, "buscas_hoje": 0, "zeradas_hoje": 0, "status": "saudavel"}]
@@ -153,9 +132,9 @@ def termos_zerados(user=Depends(require_role(["admin","gerente"]))):
     try:
         cur = conn.cursor()
         if user["role"] == "admin":
-            cur.execute("SELECT termo, empresa_id, COUNT(*) as vezes, MAX(created_at) as ultima FROM logs_busca WHERE resultados=0 AND created_at > NOW() - INTERVAL '7 days' GROUP BY termo, empresa_id ORDER BY vezes DESC LIMIT 50")
+            cur.execute("SELECT termo, empresa_id, COUNT(*) as vezes, MAX(created_at) FROM logs_busca WHERE resultados=0 AND created_at > NOW() - INTERVAL '7 days' GROUP BY termo, empresa_id ORDER BY vezes DESC LIMIT 50")
         else:
-            cur.execute("SELECT termo, empresa_id, COUNT(*) as vezes, MAX(created_at) as ultima FROM logs_busca WHERE resultados=0 AND empresa_id=%s AND created_at > NOW() - INTERVAL '7 days' GROUP BY termo, empresa_id ORDER BY vezes DESC LIMIT 50", (user["empresa_id"],))
+            cur.execute("SELECT termo, empresa_id, COUNT(*) as vezes, MAX(created_at) FROM logs_busca WHERE resultados=0 AND empresa_id=%s AND created_at > NOW() - INTERVAL '7 days' GROUP BY termo, empresa_id ORDER BY vezes DESC LIMIT 50", (user["empresa_id"],))
         return [{"termo": r[0], "empresa_id": r[1], "vezes": r[2], "ultima": r[3].isoformat() if r[3] else ""} for r in cur.fetchall()]
     finally:
         db_pool.putconn(conn)
@@ -173,12 +152,8 @@ def logs(limit: int = 100, user=Depends(require_role(["admin","gerente"]))):
     finally:
         db_pool.putconn(conn)
 
-@app.post("/admin/reindexar/{empresa_id}")
-def reindexar(empresa_id: int, user=Depends(require_role(["admin"]))):
-    return {"status": "reindexado", "empresa_id": empresa_id, "produtos": 120, "tempo_s": 2.1, "nota": "Modo leve - reindexacao completa precisa do modelo vetorial"}
-
 @app.get("/health")
-def health(): return {"status": "ok", "versao": "leve-render-free", "db": "conectado" if db_pool else "sem DATABASE_URL"}
+def health(): return {"status": "ok", "versao": "leve-render-free-corrigida", "db": "conectado" if db_pool else "sem DATABASE_URL"}
 
 @app.get("/")
 def root(): return {"message": "API Busca Vetorial Leve no ar", "docs": "/docs", "health": "/health"}
