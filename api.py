@@ -139,6 +139,54 @@ def stats(user=Depends(require_role(["admin"]))):
         return {"total_hoje": total, "zeradas": zeradas, "tempo_medio": int(tempo), "score_medio": 0.85}
     finally:
         db_pool.putconn(conn)
+        --payload nova---------------------------------------
+            payload = {
+  "sub": user["id"],
+  "email": user["email"],
+  "empresa_id": user["empresa_id"],  # ESSENCIAL
+  "role": user["role"],  # admin / gerente / analista
+  "exp": datetime.utcnow() + timedelta(days=7)
+} -----------------------------------------------------------
+        --nova api-------------------------------------------
+        from sentence_transformers import SentenceTransformer
+model = SentenceTransformer('all-MiniLM-L6-v2')
+
+@app.get("/buscar")
+def buscar_hybrid(q: str, user=Depends(get_current_user)):
+    # 1. Gera embedding da pergunta
+    query_embedding = model.encode(q).tolist()
+    
+    # 2. Query híbrida com RRF - junta vetorial + texto
+    sql = """
+    WITH semantic AS (
+      SELECT id, 1 - (embedding <=> %s::vector) as score_semantic
+      FROM produtos
+      WHERE empresa_id = %s
+      ORDER BY embedding <=> %s::vector
+      LIMIT 20
+    ),
+    keyword AS (
+      SELECT id, ts_rank(busca_texto, plainto_tsquery('portuguese', %s)) as score_keyword
+      FROM produtos
+      WHERE busca_texto @@ plainto_tsquery('portuguese', %s) AND empresa_id = %s
+      ORDER BY score_keyword DESC
+      LIMIT 20
+    )
+    SELECT p.id, p.nome, p.descricao, p.preco,
+           COALESCE(s.score_semantic, 0) as semantic,
+           COALESCE(k.score_keyword, 0) as keyword,
+           (COALESCE(s.score_semantic,0) * 0.7 + COALESCE(k.score_keyword,0) * 0.3) as score_final
+    FROM produtos p
+    LEFT JOIN semantic s ON s.id = p.id
+    LEFT JOIN keyword k ON k.id = p.id
+    WHERE s.id IS NOT NULL OR k.id IS NOT NULL
+    ORDER BY score_final DESC
+    LIMIT 10;
+    """
+    
+    cur.execute(sql, (query_embedding, user['empresa_id'], query_embedding, q, q, user['empresa_id']))
+    return cur.fetchall() 
+    ---------------------
 
 @app.get("/health")
 def health(): return {"status": "ok", "versao": "fix-publica-privada", "db": "conectado" if db_pool else "sem DATABASE_URL"}
